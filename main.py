@@ -7,6 +7,7 @@ from PIL import Image
 import io
 import re
 from anthropic import Anthropic, APIStatusError, APIError
+from openai import Client
 import difflib
 import time
 from rich.console import Console
@@ -56,11 +57,13 @@ def setup_virtual_environment() -> Tuple[str, str]:
 # Load environment variables from .env file
 load_dotenv()
 
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4-turbo")
+
 # Initialize the Anthropic client
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if not anthropic_api_key:
-    raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-client = Anthropic(api_key=anthropic_api_key)
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY not found in environment variables")
+client = Client(api_key=api_key)
 
 # Initialize the Tavily client
 tavily_api_key = os.getenv("TAVILY_API_KEY")
@@ -105,12 +108,16 @@ MAX_CONTEXT_TOKENS = 200000  # Reduced to 200k tokens for context window
 
 # Models
 # Models that maintain context memory across interactions
-MAINMODEL = "claude-3-5-sonnet-20240620"  # Maintains conversation history and file contents
+# MAINMODEL = "claude-3-5-sonnet-20240620"  # Maintains conversation history and file contents
+MAINMODEL = MODEL_NAME  # Maintains conversation history and file contents
 
 # Models that don't maintain context (memory is reset after each call)
-TOOLCHECKERMODEL = "claude-3-5-sonnet-20240620"
-CODEEDITORMODEL = "claude-3-5-sonnet-20240620"
-CODEEXECUTIONMODEL = "claude-3-5-sonnet-20240620"
+# TOOLCHECKERMODEL = "claude-3-5-sonnet-20240620"
+# CODEEDITORMODEL = "claude-3-5-sonnet-20240620"
+# CODEEXECUTIONMODEL = "claude-3-5-sonnet-20240620"
+TOOLCHECKERMODEL = MODEL_NAME
+CODEEDITORMODEL = MODEL_NAME
+CODEEXECUTIONMODEL = MODEL_NAME
 
 # System prompts
 BASE_SYSTEM_PROMPT = """
@@ -309,18 +316,21 @@ async def generate_edit_instructions(file_path, file_content, instructions, proj
         """
 
         # Make the API call to CODEEDITORMODEL (context is not maintained except for code_editor_memory)
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=CODEEDITORMODEL,
             max_tokens=8000,
-            system=system_prompt,
             extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
             messages=[
-                {"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}
-            ]
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": "Generate SEARCH/REPLACE blocks for the necessary changes.",
+                },
+            ],
         )
         # Update token usage for code editor
-        code_editor_tokens['input'] += response.usage.input_tokens
-        code_editor_tokens['output'] += response.usage.output_tokens
+        code_editor_tokens["input"] += response.usage.prompt_tokens
+        code_editor_tokens["output"] += response.usage.completion_tokens
 
         # Parse the response to extract SEARCH/REPLACE blocks
         edit_instructions = parse_search_replace_blocks(response.content[0].text)
@@ -336,7 +346,6 @@ async def generate_edit_instructions(file_path, file_content, instructions, proj
     except Exception as e:
         console.print(f"Error in generating edit instructions: {str(e)}", style="bold red")
         return []  # Return empty list if any exception occurs
-
 
 
 def parse_search_replace_blocks(response_text):
@@ -364,7 +373,7 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False,
 
         for attempt in range(max_retries):
             edit_instructions_json = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
-            
+
             if edit_instructions_json:
                 edit_instructions = json.loads(edit_instructions_json)  # Parse JSON here
                 console.print(Panel(f"Attempt {attempt + 1}/{max_retries}: The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
@@ -377,13 +386,13 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False,
                 if changes_made:
                     file_contents[path] = edited_content  # Update the file_contents with the new content
                     console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
-                    
+
                     if failed_edits:
                         console.print(Panel(f"Some edits could not be applied. Retrying...", style="yellow"))
                         instructions += f"\n\nPlease retry the following edits that could not be applied:\n{failed_edits}"
                         original_content = edited_content
                         continue
-                    
+
                     return f"Changes applied to {path}"
                 elif attempt == max_retries - 1:
                     return f"No changes could be applied to {path} after {max_retries} attempts. Please review the edit instructions and try again."
@@ -391,11 +400,10 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False,
                     console.print(Panel(f"No changes could be applied in attempt {attempt + 1}. Retrying...", style="yellow"))
             else:
                 return f"No changes suggested for {path}"
-        
+
         return f"Failed to apply changes to {path} after {max_retries} attempts."
     except Exception as e:
         return f"Error editing/applying to file: {str(e)}"
-
 
 
 async def apply_edits(file_path, edit_instructions, original_content):
@@ -795,20 +803,25 @@ async def send_to_ai_for_executing(code, execution_result):
         IMPORTANT: PROVIDE ONLY YOUR ANALYSIS AND OBSERVATIONS. DO NOT INCLUDE ANY PREFACING STATEMENTS OR EXPLANATIONS OF YOUR ROLE.
         """
 
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=CODEEXECUTIONMODEL,
             max_tokens=2000,
-            system=system_prompt,
+            # system=system_prompt,
             messages=[
-                {"role": "user", "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
-            ]
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}",
+                },
+            ],
         )
 
         # Update token usage for code execution
-        code_execution_tokens['input'] += response.usage.input_tokens
-        code_execution_tokens['output'] += response.usage.output_tokens
+        code_execution_tokens["input"] += response.usage.prompt_tokens
+        code_execution_tokens["output"] += response.usage.completion_tokens
 
-        analysis = response.content[0].text
+        # analysis = response.content[0].text
+        analysis = response.choices[0].message.content.strip()
 
         return analysis
 
@@ -821,7 +834,7 @@ def save_chat():
     # Generate filename
     now = datetime.datetime.now()
     filename = f"Chat_{now.strftime('%H%M')}.md"
-    
+
     # Format conversation history
     formatted_chat = "# Claude-3-Sonnet Engineer Chat Log\n\n"
     for message in conversation_history:
@@ -840,13 +853,12 @@ def save_chat():
             for content in message['content']:
                 if content['type'] == 'tool_result':
                     formatted_chat += f"### Tool Result\n\n```\n{content['content']}\n```\n\n"
-    
+
     # Save to file
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(formatted_chat)
-    
-    return filename
 
+    return filename
 
 
 async def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
@@ -901,7 +913,9 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
                 )
             ]
             if filtered_content:
-                filtered_conversation_history.append({**message, 'content': filtered_content})
+                filtered_conversation_history.append(
+                    {**message, "content": json.dumps(filtered_content)}
+                )
         else:
             filtered_conversation_history.append(message)
 
@@ -910,18 +924,26 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
 
     try:
         # MAINMODEL call, which maintains context
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MAINMODEL,
             max_tokens=8000,
-            system=update_system_prompt(current_iteration, max_iterations),
+            # system=update_system_prompt(current_iteration, max_iterations),
             extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "auto"}
+            messages=[
+                {
+                    "role": "system",
+                    "content": update_system_prompt(current_iteration, max_iterations),
+                }
+            ]
+            + messages,
+            # tools=tools,
+            # tool_choice={"type": "auto"}
+            tools=[{"type": "function", "function": item} for item in tools],
+            tool_choice="auto",
         )
         # Update token usage for MAINMODEL
-        main_model_tokens['input'] += response.usage.input_tokens
-        main_model_tokens['output'] += response.usage.output_tokens
+        main_model_tokens["input"] += response.usage.prompt_tokens
+        main_model_tokens["output"] += response.usage.completion_tokens
     except APIStatusError as e:
         if e.status_code == 429:
             console.print(Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
@@ -938,13 +960,15 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
     exit_continuation = False
     tool_uses = []
 
-    for content_block in response.content:
-        if content_block.type == "text":
-            assistant_response += content_block.text
-            if CONTINUATION_EXIT_PHRASE in content_block.text:
+    # print(response)
+
+    for content_block in response.choices:
+        if content_block.message.tool_calls is not None:
+            tool_uses.extend(content_block.message.tool_calls)
+        else:
+            assistant_response += content_block.message.content
+            if CONTINUATION_EXIT_PHRASE in content_block.message.content:
                 exit_continuation = True
-        elif content_block.type == "tool_use":
-            tool_uses.append(content_block)
 
     console.print(Panel(Markdown(assistant_response), title="Claude's Response", title_align="left", border_style="blue", expand=False))
 
@@ -956,43 +980,51 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
     console.print(Panel(files_in_context, title="Files in Context", title_align="left", border_style="white", expand=False))
 
     for tool_use in tool_uses:
-        tool_name = tool_use.name
-        tool_input = tool_use.input
+        tool_name = tool_use.function.name
+        tool_input = json.loads(tool_use.function.arguments)
         tool_use_id = tool_use.id
 
         console.print(Panel(f"Tool Used: {tool_name}", style="green"))
         console.print(Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
 
         tool_result = await execute_tool(tool_name, tool_input)
-        
+
         if tool_result["is_error"]:
             console.print(Panel(tool_result["content"], title="Tool Execution Error", style="bold red"))
         else:
             console.print(Panel(tool_result["content"], title_align="left", title="Tool Result", style="green"))
 
-        current_conversation.append({
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": tool_name,
-                    "input": tool_input
-                }
-            ]
-        })
+        current_conversation.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": tool_name,
+                            "input": tool_input,
+                        }
+                    ]
+                ),
+            }
+        )
 
-        current_conversation.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": tool_result["content"],
-                    "is_error": tool_result["is_error"]
-                }
-            ]
-        })
+        current_conversation.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_result["content"],
+                            "is_error": tool_result["is_error"],
+                        }
+                    ]
+                ),
+            }
+        )
 
         # Update the file_contents dictionary if applicable
         if tool_name in ['create_file', 'edit_and_apply', 'read_file'] and not tool_result["is_error"]:
@@ -1005,25 +1037,37 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
                     pass
 
         messages = filtered_conversation_history + current_conversation
+        # print(messages)
 
         try:
-            tool_response = client.messages.create(
+            tool_response = client.chat.completions.create(
                 model=TOOLCHECKERMODEL,
                 max_tokens=8000,
-                system=update_system_prompt(current_iteration, max_iterations),
+                # system=update_system_prompt(current_iteration, max_iterations),
                 extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
-                messages=messages,
-                tools=tools,
-                tool_choice={"type": "auto"}
+                messages=[
+                    {
+                        "role": "system",
+                        "content": update_system_prompt(
+                            current_iteration, max_iterations
+                        ),
+                    }
+                ]
+                + messages,
+                # tools=tools,
+                # tool_choice={"type": "auto"}
+                tools=[{"type": "function", "function": item} for item in tools],
+                tool_choice="auto",
             )
             # Update token usage for tool checker
-            tool_checker_tokens['input'] += tool_response.usage.input_tokens
-            tool_checker_tokens['output'] += tool_response.usage.output_tokens
+            tool_checker_tokens["input"] += tool_response.usage.prompt_tokens
+            tool_checker_tokens["output"] += tool_response.usage.completion_tokens
 
             tool_checker_response = ""
-            for tool_content_block in tool_response.content:
-                if tool_content_block.type == "text":
-                    tool_checker_response += tool_content_block.text
+
+            for tool_content_block in tool_response.choices:
+                tool_checker_response += tool_content_block.message.content
+
             console.print(Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result",  title_align="left", border_style="blue", expand=False))
             assistant_response += "\n\n" + tool_checker_response
         except APIError as e:
@@ -1130,7 +1174,6 @@ def display_token_usage():
     )
 
     console.print(table)
-
 
 
 async def main():
